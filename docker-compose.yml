@@ -22,7 +22,7 @@ services:
     expose:
       - "${PORT:-3100}"
     environment:
-      DATABASE_URL: "${DATABASE_URL:-postgres://paperclip:paperclip@db:5432/paperclip}"
+      DATABASE_URL: "${DATABASE_URL}"
       PORT: "${PORT:-3100}"
       SERVE_UI: "${SERVE_UI:-true}"
       PAPERCLIP_DEPLOYMENT_MODE: "${PAPERCLIP_DEPLOYMENT_MODE:-authenticated}"
