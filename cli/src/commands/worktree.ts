@@ -41,6 +41,8 @@ import {
   projects,
   runDatabaseBackup,
   runDatabaseRestore,
+  createEmbeddedPostgresLogBuffer,
+  formatEmbeddedPostgresError,
 } from "@paperclipai/db";
 import type { Command } from "commander";
 import { ensureAgentJwtSecret, loadPaperclipEnvFile, mergePaperclipEnvEntries, readPaperclipEnvEntries, resolvePaperclipEnvFile } from "../config/env.js";
@@ -78,6 +80,7 @@ import {
 
 type WorktreeInitOptions = {
   name?: string;
+  color?: string;
   instance?: string;
   home?: string;
   fromConfig?: string;
@@ -93,6 +96,22 @@ type WorktreeInitOptions = {
 
 type WorktreeMakeOptions = WorktreeInitOptions & {
   startPoint?: string;
+};
+
+type WorktreeReseedOptions = {
+  fromConfig?: string;
+  fromDataDir?: string;
+  fromInstance?: string;
+  home?: string;
+  seedMode?: string;
+  yes?: boolean;
+  seed?: boolean;
+};
+
+type WorktreeReseedBackup = {
+  tempRoot: string;
+  repoConfigDirBackup: string | null;
+  instanceRootBackup: string | null;
 };
 
 type WorktreeEnvOptions = {
@@ -465,6 +484,62 @@ async function findAvailablePort(preferredPort: number, reserved = new Set<numbe
   return port;
 }
 
+function resolveRepoManagedWorktreesRoot(cwd: string): string | null {
+  const normalized = path.resolve(cwd);
+  const marker = `${path.sep}.paperclip${path.sep}worktrees${path.sep}`;
+  const index = normalized.indexOf(marker);
+  if (index === -1) return null;
+  const repoRoot = normalized.slice(0, index);
+  return path.resolve(repoRoot, ".paperclip", "worktrees");
+}
+
+function collectClaimedWorktreePorts(homeDir: string, currentInstanceId: string, cwd: string): {
+  serverPorts: Set<number>;
+  databasePorts: Set<number>;
+} {
+  const serverPorts = new Set<number>();
+  const databasePorts = new Set<number>();
+  const configPaths = new Set<string>();
+  const instancesDir = path.resolve(homeDir, "instances");
+  if (existsSync(instancesDir)) {
+    for (const entry of readdirSync(instancesDir, { withFileTypes: true })) {
+      if (!entry.isDirectory() || entry.name === currentInstanceId) continue;
+
+      const configPath = path.resolve(instancesDir, entry.name, "config.json");
+      if (existsSync(configPath)) {
+        configPaths.add(configPath);
+      }
+    }
+  }
+
+  const repoManagedWorktreesRoot = resolveRepoManagedWorktreesRoot(cwd);
+  if (repoManagedWorktreesRoot && existsSync(repoManagedWorktreesRoot)) {
+    for (const entry of readdirSync(repoManagedWorktreesRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const configPath = path.resolve(repoManagedWorktreesRoot, entry.name, ".paperclip", "config.json");
+      if (existsSync(configPath)) {
+        configPaths.add(configPath);
+      }
+    }
+  }
+
+  for (const configPath of configPaths) {
+    try {
+      const config = readConfig(configPath);
+      if (config?.server.port) {
+        serverPorts.add(config.server.port);
+      }
+      if (config?.database.mode === "embedded-postgres") {
+        databasePorts.add(config.database.embeddedPostgresPort);
+      }
+    } catch {
+      // Ignore malformed sibling configs.
+    }
+  }
+
+  return { serverPorts, databasePorts };
+}
+
 function detectGitBranchName(cwd: string): string | null {
   try {
     const value = execFileSync("git", ["branch", "--show-current"], {
@@ -750,6 +825,7 @@ async function ensureEmbeddedPostgres(dataDir: string, preferredPort: number): P
   }
 
   const port = await findAvailablePort(preferredPort);
+  const logBuffer = createEmbeddedPostgresLogBuffer();
   const instance = new EmbeddedPostgres({
     databaseDir: dataDir,
     user: "paperclip",
@@ -757,17 +833,31 @@ async function ensureEmbeddedPostgres(dataDir: string, preferredPort: number): P
     port,
     persistent: true,
     initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
-    onLog: () => {},
-    onError: () => {},
+    onLog: logBuffer.append,
+    onError: logBuffer.append,
   });
 
   if (!existsSync(path.resolve(dataDir, "PG_VERSION"))) {
-    await instance.initialise();
+    try {
+      await instance.initialise();
+    } catch (error) {
+      throw formatEmbeddedPostgresError(error, {
+        fallbackMessage: `Failed to initialize embedded PostgreSQL cluster in ${dataDir} on port ${port}`,
+        recentLogs: logBuffer.getRecentLogs(),
+      });
+    }
   }
   if (existsSync(postmasterPidFile)) {
     rmSync(postmasterPidFile, { force: true });
   }
-  await instance.start();
+  try {
+    await instance.start();
+  } catch (error) {
+    throw formatEmbeddedPostgresError(error, {
+      fallbackMessage: `Failed to start embedded PostgreSQL on port ${port}`,
+      recentLogs: logBuffer.getRecentLogs(),
+    });
+  }
 
   return {
     port,
@@ -869,8 +959,8 @@ async function runWorktreeInit(opts: WorktreeInitOptions): Promise<void> {
     instanceId,
   });
   const branding = {
-    name: worktreeName,
-    color: generateWorktreeColor(),
+    name: opts.name ?? worktreeName,
+    color: opts.color ?? generateWorktreeColor(),
   };
   const sourceConfigPath = resolveSourceConfigPath(opts);
   const sourceConfig = existsSync(sourceConfigPath) ? readConfig(sourceConfigPath) : null;
@@ -886,10 +976,14 @@ async function runWorktreeInit(opts: WorktreeInitOptions): Promise<void> {
     rmSync(paths.instanceRoot, { recursive: true, force: true });
   }
 
+  const claimedPorts = collectClaimedWorktreePorts(paths.homeDir, paths.instanceId, paths.cwd);
   const preferredServerPort = opts.serverPort ?? ((sourceConfig?.server.port ?? 3100) + 1);
-  const serverPort = await findAvailablePort(preferredServerPort);
+  const serverPort = await findAvailablePort(preferredServerPort, claimedPorts.serverPorts);
   const preferredDbPort = opts.dbPort ?? ((sourceConfig?.database.embeddedPostgresPort ?? 54329) + 1);
-  const databasePort = await findAvailablePort(preferredDbPort, new Set([serverPort]));
+  const databasePort = await findAvailablePort(
+    preferredDbPort,
+    new Set([...claimedPorts.databasePorts, serverPort]),
+  );
   const targetConfig = buildWorktreeConfig({
     sourceConfig,
     paths,
@@ -972,6 +1066,160 @@ export async function worktreeInitCommand(opts: WorktreeInitOptions): Promise<vo
   printPaperclipCliBanner();
   p.intro(pc.bgCyan(pc.black(" paperclipai worktree init ")));
   await runWorktreeInit(opts);
+}
+
+function hasExplicitSourceSelection(opts: {
+  fromConfig?: string;
+  fromDataDir?: string;
+  fromInstance?: string;
+  sourceConfigPathOverride?: string;
+}): boolean {
+  return Boolean(
+    nonEmpty(opts.fromConfig)
+    || nonEmpty(opts.fromDataDir)
+    || nonEmpty(opts.fromInstance)
+    || nonEmpty(opts.sourceConfigPathOverride),
+  );
+}
+
+function resolveCurrentWorktreeReseedState(opts: { home?: string } = {}) {
+  const currentConfigPath = resolveConfigPath();
+  if (!existsSync(currentConfigPath)) {
+    throw new Error(
+      "Current directory does not have a Paperclip worktree config. Run `paperclipai worktree init` here first.",
+    );
+  }
+  const currentConfig = readConfig(currentConfigPath);
+  if (!currentConfig) {
+    throw new Error(`Could not read current worktree config at ${currentConfigPath}.`);
+  }
+  if (currentConfig.database.mode !== "embedded-postgres") {
+    throw new Error("Worktree reseed only supports embedded-postgres worktree instances.");
+  }
+
+  const currentEnvEntries = readPaperclipEnvEntries(resolvePaperclipEnvFile(currentConfigPath));
+  const instanceRoot = path.dirname(currentConfig.database.embeddedPostgresDataDir);
+  const derivedHomeDir = path.dirname(path.dirname(instanceRoot));
+
+  return {
+    currentConfigPath: path.resolve(currentConfigPath),
+    instanceId:
+      nonEmpty(currentEnvEntries.PAPERCLIP_INSTANCE_ID)
+      ?? nonEmpty(path.basename(instanceRoot))
+      ?? sanitizeWorktreeInstanceId(path.basename(process.cwd())),
+    homeDir: path.resolve(expandHomePrefix(opts.home ?? currentEnvEntries.PAPERCLIP_HOME ?? derivedHomeDir)),
+    serverPort: currentConfig.server.port,
+    dbPort: currentConfig.database.embeddedPostgresPort,
+    worktreeName: nonEmpty(currentEnvEntries.PAPERCLIP_WORKTREE_NAME) ?? undefined,
+    worktreeColor: nonEmpty(currentEnvEntries.PAPERCLIP_WORKTREE_COLOR) ?? undefined,
+  };
+}
+
+async function snapshotDirectory(sourcePath: string, targetPath: string): Promise<string | null> {
+  if (!existsSync(sourcePath)) {
+    return null;
+  }
+  await fsPromises.cp(sourcePath, targetPath, { recursive: true });
+  return targetPath;
+}
+
+async function snapshotWorktreeReseedState(target: {
+  repoConfigDir: string;
+  instanceRoot: string;
+}): Promise<WorktreeReseedBackup> {
+  const tempRoot = await fsPromises.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-reseed-backup-"));
+  return {
+    tempRoot,
+    repoConfigDirBackup: await snapshotDirectory(
+      target.repoConfigDir,
+      path.resolve(tempRoot, "repo-config"),
+    ),
+    instanceRootBackup: await snapshotDirectory(
+      target.instanceRoot,
+      path.resolve(tempRoot, "instance-root"),
+    ),
+  };
+}
+
+async function restoreDirectoryBackup(backupPath: string | null, targetPath: string): Promise<void> {
+  rmSync(targetPath, { recursive: true, force: true });
+  if (!backupPath) {
+    return;
+  }
+  await fsPromises.cp(backupPath, targetPath, { recursive: true });
+}
+
+async function restoreWorktreeReseedState(
+  backup: WorktreeReseedBackup,
+  target: { repoConfigDir: string; instanceRoot: string },
+): Promise<void> {
+  await restoreDirectoryBackup(backup.repoConfigDirBackup, target.repoConfigDir);
+  await restoreDirectoryBackup(backup.instanceRootBackup, target.instanceRoot);
+}
+
+export async function worktreeReseedCommand(opts: WorktreeReseedOptions): Promise<void> {
+  printPaperclipCliBanner();
+  p.intro(pc.bgCyan(pc.black(" paperclipai worktree reseed ")));
+
+  if (!hasExplicitSourceSelection(opts)) {
+    throw new Error(
+      "Reseed requires an explicit source. Pass --from-config or --from-instance (optionally with --from-data-dir).",
+    );
+  }
+
+  const target = resolveCurrentWorktreeReseedState({ home: opts.home });
+  const sourceConfigPath = resolveSourceConfigPath(opts);
+  if (path.resolve(sourceConfigPath) === target.currentConfigPath) {
+    throw new Error(
+      "Source and target Paperclip configs are the same. Pass a different source instance/config when reseeding.",
+    );
+  }
+
+  const seedMode = opts.seedMode ?? "minimal";
+  if (!isWorktreeSeedMode(seedMode)) {
+    throw new Error(`Unsupported seed mode "${seedMode}". Expected one of: minimal, full.`);
+  }
+
+  const confirmed = opts.yes
+    ? true
+    : await p.confirm({
+      message: `Reseed the current worktree instance (${target.instanceId}) from ${sourceConfigPath}? This overwrites only the current worktree Paperclip instance data.`,
+      initialValue: false,
+    });
+  if (p.isCancel(confirmed) || !confirmed) {
+    p.log.warn("Reseed cancelled.");
+    return;
+  }
+
+  const targetPaths = resolveWorktreeLocalPaths({
+    cwd: process.cwd(),
+    homeDir: target.homeDir,
+    instanceId: target.instanceId,
+  });
+  const backup = await snapshotWorktreeReseedState(targetPaths);
+
+  try {
+    await runWorktreeInit({
+      name: target.worktreeName,
+      color: target.worktreeColor,
+      instance: target.instanceId,
+      home: target.homeDir,
+      fromConfig: opts.fromConfig,
+      fromDataDir: opts.fromDataDir,
+      fromInstance: opts.fromInstance,
+      sourceConfigPathOverride: sourceConfigPath,
+      serverPort: target.serverPort,
+      dbPort: target.dbPort,
+      seed: opts.seed ?? true,
+      seedMode,
+      force: true,
+    });
+  } catch (error) {
+    await restoreWorktreeReseedState(backup, targetPaths);
+    throw error;
+  } finally {
+    rmSync(backup.tempRoot, { recursive: true, force: true });
+  }
 }
 
 export async function worktreeMakeCommand(nameArg: string, opts: WorktreeMakeOptions): Promise<void> {
@@ -2554,6 +2802,17 @@ export function registerWorktreeCommands(program: Command): void {
     .option("-c, --config <path>", "Path to config file")
     .option("--json", "Print JSON instead of shell exports")
     .action(worktreeEnvCommand);
+
+  worktree
+    .command("reseed")
+    .description("Replace the current worktree instance with a fresh seed while preserving this worktree's ports and instance id")
+    .option("--from-config <path>", "Source config.json to seed from")
+    .option("--from-data-dir <path>", "Source PAPERCLIP_HOME used when deriving the source config")
+    .option("--from-instance <id>", "Source instance id when deriving the source config")
+    .option("--home <path>", `Home root for worktree instances (env: PAPERCLIP_WORKTREES_DIR, default: ${DEFAULT_WORKTREE_HOME})`)
+    .option("--seed-mode <mode>", "Seed profile: minimal or full (default: minimal)", "minimal")
+    .option("--yes", "Skip the destructive confirmation prompt", false)
+    .action(worktreeReseedCommand);
 
   program
     .command("worktree:list")
